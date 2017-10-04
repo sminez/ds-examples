@@ -1,0 +1,305 @@
+#! /usr/bin/python3
+'''
+.: pyk :: The Python-Awk Hybrid :.
+----------------------------------
+
+pyk is an attempt to bring awk's pattern/action syntax to simple
+python based one-liners at the command line.
+'''
+import re
+import sys
+import argparse
+
+
+description = '''\
+.: pyk :: The Python/Awk Hybrid :.
+----------------------------------
+'''
+
+epilog = '''\
+------------------------------------------------------------------------------
+
+What pyk is:     quick python one-liners in the style of awk.
+What pyk is not: an Python implementation of awk.
+
+pyk programs are a thin layer around pure python that allow for the awk-like
+(pattern --> action) paradigm of programming.
+If you require more, write a normal python script!
+
+The one-minute version:
+-----------------------
+  - If a pattern evaluates to true, the action is run.
+  - Regex patterns are denoted "/regex to match/ { pattern }"
+    - "!/regex/" will invert the match
+  - A regex pattern is true if the pattern is contained in the line.
+  - Actions are python expressions, all standard python syntax is valid as the
+    parsed input is simply run through eval (you have been warned!).
+  - Actions may use awk-like $n variables for accessing the fields of a record.
+    As in awk, $0 is the entire line and $n for n > len(line) is a silent
+    failure case.
+    WARNING: Unlike Python, fields are 1-indexed not 0-indexed!
+  - Standard awk main-loop variables are accessable at all times: NR, FNR, NF.
+  - In addition, LINE and FIELDS give you the current line and fields (as you
+    would expect).
+    - WARNING: all of these are used by pyk to maintain state. You _can_ tinker
+      with them but all bets are off for the execution of your program!
+  - ";;" is used to deliminate multiple pattern action pairs.
+  - ";" is used to deliminate multiple python statements within an action.
+
+Future features:
+  - "$n ~ /regex/" or "$n !~ /regex/" for comparison to individual fields
+  - /one/.../two/ regex range?
+  - Allow assigning of RS, OFS and ORS.
+'''
+_tags = [
+    ('PATTERN', r'^.*(?=\s+\{)'),
+    ('ACTION', r'\{.*\}$'),
+]
+
+
+def eval_or_exec(code, VARS, LINE, FIELDS, NR, FNR, NF):
+    '''
+    Try to resolve name and import errors while executing the given
+    code snippet, returning any results generated.
+    '''
+    while True:
+        try:
+            if re.search('(?!<[=><!])=|^for |^if |^while ', code):
+                # TODO: find a proper way to check for statements!
+                result = exec(code, globals(), VARS)
+            else:
+                result = eval(code, globals(), VARS)
+            return result, VARS
+        except NameError as namerr:
+            # namerr.args == ("name 'NAME' is not defined",)
+            try:
+                name = namerr.args[0].split()[1][1:-1]
+                exec("{n} = __import__('{n}')".format(n=name), globals(), VARS)
+            except ImportError:
+                if VARS.get(name) is None:
+                    exec("{} = 0".format(name), globals(), VARS)
+        except IndexError:
+            # TODO: Find a way of identifying $n index errors only
+            return None, VARS
+
+
+def replace_index_lookups(text):
+    '''Convert $n awk style syntax into FIELDS[n] python syntax'''
+    for match in re.finditer(r'\$[0-9A-Za-z]+', text):
+        ix = match.group()
+        try:
+            text = text.replace(
+                ix, 'FIELDS[{}]'.format(int(ix[1:])-1)
+            )
+        except ValueError:
+            # This is a variable name: keep as a string and allow
+            # python to convert when we exec/eval.
+            text = text.replace(
+                ix, 'FIELDS[{}]'.format(ix[1:])
+            )
+    return text
+
+
+class Script:
+    '''A pyk script'''
+    def __init__(self, script_str, FS=' ', RS='\n', OFS=' ', ORS='\n'):
+        self.FS = FS
+        self.RS = RS
+        self.OFS = OFS
+        self.ORS = ORS
+        self.BEGIN = None
+        self.END = None
+        self.patterns = []
+
+        has_END = False
+
+        for ix, line in enumerate(re.split(';;|\n', script_str)):
+            line = line.strip()  # remove whitespace
+            if has_END:
+                err = 'ERROR: END not final pattern:\n{}'
+                print(err.format(line), file=sys.stderr)
+                sys.exit(1)
+
+            if line.startswith('BEGIN'):
+                if self.BEGIN is not None:
+                    err = 'ERROR: Multiple BEGIN patterns found:\n{}'
+                    print(err.format(line), file=sys.stderr)
+                    sys.exit(1)
+                elif ix != 0:
+                    err = 'ERROR: BEGIN not first pattern:\n{}'
+                    print(err.format(line), file=sys.stderr)
+                    sys.exit(1)
+                else:
+                    self.BEGIN = Pattern(line)
+            elif line.startswith('END'):
+                if self.END is not None:
+                    err = 'ERROR: Multiple END patterns found:\n{}'
+                    print(err.format(line), file=sys.stderr)
+                    sys.exit(1)
+                else:
+                    self.END = Pattern(line)
+            else:
+                self.patterns.append(Pattern(line))
+
+
+class Pattern:
+    '''A pattern and paired action'''
+    tags = re.compile(
+        r'|'.join(r'(?P<{}>{})'.format(t[0], t[1]) for t in _tags)
+    )
+
+    def __init__(self, line):
+        self._pattern = None
+        self._actions = []
+        self.is_regex = False
+        self.is_inverted_regex = False
+
+        # NOTE: This works as we have already split on \n|;;
+        if not re.fullmatch(r'^.*\{.*\}$', line):
+            # Add default print action
+            line += ' { print(LINE) }'
+
+        for match in re.finditer(self.tags, line):
+            tag = match.lastgroup
+            group = [g for g in match.groups() if g is not None]
+            text = group[1] if len(group) == 2 else match.group(tag)
+
+            if tag == 'PATTERN':
+                if self._pattern is not None:
+                    err = 'ERROR: Multiple patterns on one line:\n"{}"'
+                    print(err.format(line), file=sys.stderr)
+                    sys.exit(1)
+
+                # Tag regex patterns
+                if text.startswith('/') and text.endswith('/'):
+                    self.is_regex = True
+                    text = text[1:-1]
+                elif text.startswith('!/') and text.endswith('/'):
+                    self.is_regex = True
+                    self.is_inverted_regex = True
+                    text = text[2:-1]
+                else:
+                    text = replace_index_lookups(text)
+                self._pattern = text
+
+            elif tag == 'ACTION':
+                # Remove curlies and whitespace surrounding
+                text = text[1:-1].strip()
+                text = text.replace('$0', 'LINE')
+                text = replace_index_lookups(text)
+                # Split python into statements
+                self._actions.extend(text.split(';'))
+
+    def match(self, VARS, LINE, FIELDS, NR, FNR, NF):
+        '''
+        Very simple pattern evaluation: regexes are checked against the
+        entire line (TODO:: allow field comparisons) and other conditions
+        are simply evalated and returned as a bool.
+        '''
+        if self._pattern is None:
+            return True
+        elif self.is_regex:
+            if self.is_inverted_regex:
+                return not re.search(self._pattern, LINE)
+            else:
+                return re.search(self._pattern, LINE)
+        else:
+            try:
+                return eval(self._pattern)
+            except:
+                return False  # Errors in a pattern are a mismatch
+
+    def action(self, VARS, LINE, FIELDS, NR, FNR, NF):
+        '''
+        Attempt to carry out the action. There are a few annoying edge cases
+        where evaluation of statements vs expressions mess things up at the
+        moment...
+        '''
+        if self._actions is None:
+            print(LINE)
+        else:
+            for action in self._actions:
+                result, VARS = eval_or_exec(
+                        action, VARS, LINE, FIELDS, NR, FNR, NF
+                    )
+                if result is not None:
+                    print(result)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description=description,
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        '-F',
+        '--field-separator',
+        type=str,
+        default=' ',
+        required=False,
+        help='character or regext to use for splitting records into fields'
+    )
+    parser.add_argument('script')
+    parser.add_argument('files', nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+
+    if args.files:
+        files = [(f, open(f, 'r')) for f in args.files]
+    elif not sys.stdin.isatty():
+        files = [('stdin', sys.stdin)]
+    else:
+        print('ERROR: unable to detect input', file=sys.stderr)
+        sys.exit(1)
+
+    # Parse script pattern/action pairs
+    script = Script(args.script, args.field_separator)
+    VARS = {}  # NOTE: This is the pyk internal state
+    NR = 0
+    FNR = 0
+    NF = 0
+    FILE = ''
+    LINE = ''
+    FIELDS = []
+
+    # Evaluate BEGIN actions
+    if script.BEGIN is not None:
+        script.BEGIN.action(VARS, LINE, FIELDS, NR, FNR, NF)
+
+    # Main loop
+    for fname, file in files:
+        FNR = 0
+        FILENAME = fname
+
+        for LINE in file:
+            # Remove trailing whitespace and newlines
+            LINE = LINE.rstrip()
+            FIELDS = LINE.split(script.FS)
+
+            # Try to convert numerics
+            for index, field in enumerate(FIELDS):
+                try:
+                    FIELDS[index] = int(field)
+                except ValueError:
+                    try:
+                        FIELDS[index] = float(field)
+                    except ValueError:
+                        pass
+
+            # Bump the record counts and store the number of fields
+            NR += 1
+            FNR += 1
+            NF = len(FIELDS)
+
+            # Check patterns for matches
+            for pattern in script.patterns:
+                if pattern.match(VARS, LINE, FIELDS, NR, FNR, NF):
+                    pattern.action(VARS, LINE, FIELDS, NR, FNR, NF)
+
+        # Close input files when we're done but not stdin
+        if args.files:
+            file.close()
+
+    # Evaluate END actions
+    if script.END is not None:
+        script.END.action(VARS, LINE, FIELDS, NR, FNR, NF)
